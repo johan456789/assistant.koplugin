@@ -278,7 +278,7 @@ function AssitantDialog:show(highlightedText)
           })
           return
         end
-        self:_close()
+            -- self:_close() -- Moved this call to after a successful API response
         self:_prepareMessageHistoryForUserQuery(message_history, highlightedText, user_question)
         Trapper:wrap(function()
           local answer, err = self.querier:query(message_history)
@@ -313,10 +313,10 @@ function AssitantDialog:show(highlightedText)
       table.insert(all_buttons, {
         text = _("Dictionary"),
         callback = function()
-          self:_close()
+              -- self:_close() -- Don't close here, let the dictionary dialog handle it
           local showDictionaryDialog = require("dictdialog")
           Trapper:wrap(function()
-            showDictionaryDialog(self.assitant, highlightedText)
+                showDictionaryDialog(self.assitant, highlightedText, self) -- Pass self to allow closing parent
           end)
         end
       })  
@@ -328,9 +328,9 @@ function AssitantDialog:show(highlightedText)
       table.insert(all_buttons, {
         text = tab.text,
         callback = function()
-          self:_close()
+              -- self:_close() -- Don't close here, let showCustomPrompt handle it
           Trapper:wrap(function()
-            self:showCustomPrompt(highlightedText, tab.idx)
+                self:showCustomPrompt(highlightedText, tab.idx, true) -- Pass true to indicate it should close parent
           end)
         end
       })
@@ -381,7 +381,11 @@ end
 
 -- Process main select popup buttons
 -- ( custom prompts from configuration )
-function AssitantDialog:showCustomPrompt(highlightedText, prompt_index)
+    function AssitantDialog:showCustomPrompt(highlightedText, prompt_index, should_close_parent)
+
+      if should_close_parent then
+        self:_close()
+      end
 
   local prompt_config = Prompts.getMergedCustomPrompts()[prompt_index]
 
@@ -402,6 +406,12 @@ function AssitantDialog:showCustomPrompt(highlightedText, prompt_index)
   local answer, err = self.querier:query(message_history, string.format("🌐 Loading for %s ...", title or prompt_index))
   if err then
     UIManager:show(InfoMessage:new{text = err, icon = "notice-warning"})
+        -- If parent was closed, and this fails, we need to re-show or handle appropriately.
+        -- For now, just showing error. If this came from the main dialog, it will remain open.
+        if should_close_parent then
+            -- Potentially re-open the input dialog here if needed, or provide a way back.
+            -- For now, the user would have to re-trigger the main dialog.
+        end
     return
   end
   if answer then

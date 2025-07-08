@@ -9,7 +9,7 @@ local Event = require("ui/event")
 local configuration = require("configuration")
 local dict_prompts = require("prompts").assitant_prompts.dict
 
-local function showDictionaryDialog(assitant, highlightedText, message_history)
+local function showDictionaryDialog(assitant, highlightedText, parent_dialog, message_history)
     local Querier = assitant.querier
     local ui = assitant.ui
 
@@ -44,7 +44,7 @@ local function showDictionaryDialog(assitant, highlightedText, message_history)
                             UIManager:close(input_dialog)
                             if word and word ~= "" then
                                 -- Recursively call with the entered word
-                                showDictionaryDialog(assitant, word, message_history)
+                                showDictionaryDialog(assitant, word, parent_dialog, message_history)
                             end
                         end,
                     },
@@ -130,6 +130,11 @@ local function showDictionaryDialog(assitant, highlightedText, message_history)
     if err ~= nil then
         UIManager:show(InfoMessage:new{ icon = "notice-warning", text = err })
         return
+    end
+
+    -- If we have a parent dialog (AssitantDialog) and the query was successful, close it.
+    if parent_dialog and parent_dialog._close then
+        parent_dialog:_close()
     end
 
     local function createResultText(highlightedText, answer)
