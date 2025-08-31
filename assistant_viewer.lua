@@ -44,6 +44,7 @@ local Prompts = require("assistant_prompts")
 local VIEWER_CSS = [[
 @page {
     margin: 0;
+    font-family: 'Noto Sans CJK TC', 'Noto Sans Arabic', 'Noto Sans Devanagari UI', 'Noto Sans Bengali UI', 'FreeSans', 'Noto Sans', sans-serif;
 }
 
 body {
