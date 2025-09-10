@@ -222,6 +222,14 @@ function SettingsDialog:init()
             end
         },
         {
+            text = _("Use new streaming viewer"),
+            checked = self.settings:readSetting("use_stream_mode_chatgptviewer", true),
+            callback = function()
+                self.settings:toggle("use_stream_mode_chatgptviewer")
+                self.assistant.updated = true
+            end
+        },
+        {
             text = _("Use AI Assistant for 'Translate'"),
             checked = self.settings:readSetting("ai_translate_override", false),
             callback = function()

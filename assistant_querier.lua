@@ -6,6 +6,7 @@ local ConfirmBox  = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
 local InputText = require("ui/widget/inputtext")
 local UIManager = require("ui/uimanager")
+local ChatGPTViewer = require("assistant_viewer")
 local Font = require("ui/font")
 local koutil = require("util")
 local logger = require("logger")
@@ -24,6 +25,11 @@ local Querier = {
     provider_name = nil,
     interrupt_stream = nil,      -- function to interrupt the stream query
     user_interrupted = false,  -- flag to indicate if the stream was interrupted
+    -- Streaming viewer state
+    stream_buffer = nil,          -- table buffer for chunks
+    stream_timer_func = nil,      -- scheduled render function for throttling
+    stream_active_viewer = nil,   -- active ChatGPTViewer during stream
+    stream_accumulated = nil,     -- accumulated response text
 }
 
 function Querier:new(o)
@@ -143,69 +149,166 @@ function Querier:query(message_history, title)
     UIManager:close(infomsg)
 
     -- when res is a function, it means we are in streaming mode
-    -- open a stream dialog and run the background query in a subprocess
+    -- open a UI and run the background query in a subprocess
     if type(res) == "function" then
         self.user_interrupted = false -- reset the stream interrupted flag
-        local streamDialog 
+        local use_stream_mode_chatgptviewer = self.settings:readSetting("use_stream_mode_chatgptviewer", true)
 
-        local function _closeStreamDialog()
-            if self.interrupt_stream then self.interrupt_stream() end
-            UIManager:close(streamDialog)
-        end
+        if use_stream_mode_chatgptviewer then
+            -- Initialize buffered, throttled rendering into ChatGPTViewer
+            self.stream_buffer = {}
+            self.stream_accumulated = ""
+            local interval_ms = tonumber(self.settings:readSetting("stream_render_interval_ms", 750)) or 750
+            if interval_ms < 300 then interval_ms = 300 end
+            if interval_ms > 2000 then interval_ms = 2000 end
 
-        streamDialog = InputDialog:new{
-            width = Screen:getWidth() - Screen:scaleBySize(30),
-            title = _("AI is responding"),
-            description = T("☁ %1/%2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model")),
-            inputtext_class = StreamText, -- use our custom InputText class
-            input_face = Font:getFace("infofont", self.settings:readSetting("response_font_size") or 20),
-            title_bar_left_icon = "appbar.settings",
-            title_bar_left_icon_tap_callback = function ()
-                self.assistant:showSettings()
-            end,
+            local function cancel_timer()
+                if self.stream_timer_func then
+                    UIManager:unschedule(self.stream_timer_func)
+                    self.stream_timer_func = nil
+                end
+            end
 
-            readonly = true,  
-            fullscreen = false, use_available_height = true,
-            allow_newline = true, add_nav_bar = false, cursor_at_end = true, add_scroll_buttons = true,
-            condensed = true, auto_para_direction = true, is_movable = false, scroll_by_pan = true, 
-            buttons = {
-                {
+            local function schedule_render_once()
+                if self.stream_timer_func then return end
+                self.stream_timer_func = function()
+                    -- Concat buffered chunks and render
+                    local chunk = table.concat(self.stream_buffer)
+                    self.stream_buffer = {}
+                    if #chunk > 0 then
+                        self.stream_accumulated = self.stream_accumulated .. chunk
+                        if self.stream_active_viewer then
+                            self.stream_active_viewer:updateStreamingMarkdown(self.stream_accumulated)
+                        end
+                    end
+                    -- Clear timer handle; next chunk will reschedule
+                    self.stream_timer_func = nil
+                end
+                UIManager:scheduleIn(interval_ms / 1000, self.stream_timer_func)
+            end
+
+            -- Create viewer up-front
+            local initial_text = string.format("☁ %s/%s\n\n%s", self.provider_name, koutil.tableGetValue(self.provider_settings, "model"), _("Generating…"))
+            local viewer
+            viewer = ChatGPTViewer:new{
+                title = _("AI is responding"),
+                text = initial_text,
+                assistant = self.assistant,
+                ui = self.assistant.ui,
+                render_markdown = koutil.tableGetValue(self.assistant.CONFIGURATION, "features", "render_markdown") or true,
+                default_hold_callback = function() if viewer then viewer:HoldClose() end end,
+                close_callback = function()
+                    -- Map Close to Stop semantics
+                    self.user_interrupted = true
+                    cancel_timer()
+                    if self.interrupt_stream then self.interrupt_stream() end
+                    self.stream_active_viewer = nil
+                end,
+            }
+            self.stream_active_viewer = viewer
+            UIManager:show(viewer)
+
+            local ok, content, err = pcall(self.processStream, self, res, function (content_piece)
+                if self.user_interrupted then return end
+                table.insert(self.stream_buffer, content_piece)
+                schedule_render_once()
+            end)
+            if not ok then
+                logger.warn("Error processing stream: " .. tostring(content))
+                err = content -- content contains the error message
+            end
+
+            -- Finalize viewer and state
+            cancel_timer()
+            if not self.user_interrupted and self.stream_active_viewer then
+                -- Flush remaining buffer
+                if self.stream_buffer and #self.stream_buffer > 0 then
+                    local chunk = table.concat(self.stream_buffer)
+                    self.stream_accumulated = self.stream_accumulated .. chunk
+                    self.stream_buffer = {}
+                end
+                if err then
+                    local markdown_err = T(_("### API Error\n\n%1"), tostring(err))
+                    self.stream_active_viewer:updateStreamingMarkdown(markdown_err)
+                else
+                    self.stream_active_viewer:updateStreamingMarkdown(self.stream_accumulated)
+                end
+            end
+            self.stream_buffer = nil
+            self.stream_timer_func = nil
+            self.stream_active_viewer = self.stream_active_viewer -- keep for AssistantDialog final formatting
+
+            if self.user_interrupted then
+                return nil, _("Request cancelled by user.")
+            end
+
+            if err then
+                return nil, err:gsub("^[\n%s]*", "")
+            end
+
+            res = content
+        else
+            local streamDialog 
+
+            local function _closeStreamDialog()
+                if self.interrupt_stream then self.interrupt_stream() end
+                UIManager:close(streamDialog)
+            end
+
+            streamDialog = InputDialog:new{
+                width = Screen:getWidth() - Screen:scaleBySize(30),
+                title = _("AI is responding"),
+                description = T("☁ %1/%2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model")),
+                inputtext_class = StreamText, -- use our custom InputText class
+                input_face = Font:getFace("infofont", self.settings:readSetting("response_font_size") or 20),
+                title_bar_left_icon = "appbar.settings",
+                title_bar_left_icon_tap_callback = function ()
+                    self.assistant:showSettings()
+                end,
+
+                readonly = true,  
+                fullscreen = false, use_available_height = true,
+                allow_newline = true, add_nav_bar = false, cursor_at_end = true, add_scroll_buttons = true,
+                condensed = true, auto_para_direction = true, is_movable = false, scroll_by_pan = true, 
+                buttons = {
                     {
-                        text = _("⏹ Stop"),
-                        id = "close", -- id:close response to default cancel action (esc key ...)
-                        callback = _closeStreamDialog,
-                    },
+                        {
+                            text = _("⏹ Stop"),
+                            id = "close", -- id:close response to default cancel action (esc key ...)
+                            callback = _closeStreamDialog,
+                        },
+                    }
                 }
             }
-        }
 
-        --  adds a close button to the top right
-        streamDialog.title_bar.close_callback = _closeStreamDialog
-        streamDialog.title_bar:init()
+            --  adds a close button to the top right
+            streamDialog.title_bar.close_callback = _closeStreamDialog
+            streamDialog.title_bar:init()
 
-        UIManager:show(streamDialog)
-        local ok, content, err = pcall(self.processStream, self, res, function (content)
-            UIManager:nextTick(function ()
-                -- schedule the text update in the UIManager task queue
-                streamDialog:addTextToInput(content)
+            UIManager:show(streamDialog)
+            local ok, content, err = pcall(self.processStream, self, res, function (content)
+                UIManager:nextTick(function ()
+                    -- schedule the text update in the UIManager task queue
+                    streamDialog:addTextToInput(content)
+                end)
             end)
-        end)
-        if not ok then
-            logger.warn("Error processing stream: " .. tostring(content))
-            err = content -- content contains the error message
+            if not ok then
+                logger.warn("Error processing stream: " .. tostring(content))
+                err = content -- content contains the error message
+            end
+
+            UIManager:close(streamDialog)
+
+            if self.user_interrupted then
+                return nil, _("Request cancelled by user.")
+            end
+
+            if err then
+                return nil, err:gsub("^[\n%s]*", "") -- clean leading spaces and newlines
+            end
+
+            res = content
         end
-
-        UIManager:close(streamDialog)
-
-        if self.user_interrupted then
-            return nil, _("Request cancelled by user.")
-        end
-
-        if err then
-            return nil, err:gsub("^[\n%s]*", "") -- clean leading spaces and newlines
-        end
-
-        res = content
     end
 
     if err == self.handler.CODE_CANCELLED then

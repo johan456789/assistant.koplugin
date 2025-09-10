@@ -139,6 +139,44 @@ end
 function AssistantDialog:_createAndShowViewer(highlightedText, message_history, title)
   local result_text = self:_createResultText(highlightedText, message_history, nil, title)
   
+  -- If a streaming viewer is already open, reuse and finalize it
+  local existing_viewer = self.querier and self.querier.stream_active_viewer or nil
+  if existing_viewer then
+    existing_viewer.title = title
+    existing_viewer.assistant = self.assistant
+    existing_viewer.ui = self.assistant.ui
+    existing_viewer.highlighted_text = highlightedText
+    existing_viewer.message_history = message_history
+    existing_viewer.render_markdown = koutil.tableGetValue(self.CONFIGURATION, "features", "render_markdown") or true
+    existing_viewer.onAskQuestion = function(viewer, user_question)
+      local current_highlight = viewer.highlighted_text or highlightedText
+      local viewer_title = ""
+      if type(user_question) == "string" then
+        self:_prepareMessageHistoryForUserQuery(message_history, current_highlight, user_question)
+      elseif type(user_question) == "table" then
+        viewer_title = user_question.text or "Custom Prompt"
+        table.insert(message_history, {
+          role = "user",
+          content = self:_formatUserPrompt(user_question.user_prompt, current_highlight)
+        })
+      end
+      Trapper:wrap(function()
+        local answer, err = self.querier:query(message_history)
+        if err then
+          self.querier:showError(err)
+          return
+        end
+        table.insert(message_history, { role = "assistant", content = answer })
+        viewer:update(self:_createResultText(current_highlight, message_history, viewer.text, viewer_title))
+        if viewer.scroll_text_w then viewer.scroll_text_w:resetScroll() end
+      end)
+    end
+    existing_viewer:update(result_text)
+    -- Clear the reference so subsequent queries open fresh viewers
+    self.querier.stream_active_viewer = nil
+    return
+  end
+
   local chatgpt_viewer 
   chatgpt_viewer = ChatGPTViewer:new {
     title = title,

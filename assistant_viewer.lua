@@ -449,7 +449,7 @@ function ChatGPTViewer:init()
 
   if self.render_markdown then
     -- Convert Markdown to HTML and render in a ScrollHtmlWidget
-    local html_body, err = MD(self.text, {})
+    local html_body, err = MD(self.text)
     if err then
       logger.warn("ChatGPTViewer: could not generate HTML", err)
       -- Fallback to plain text if HTML generation fails
@@ -907,7 +907,7 @@ function ChatGPTViewer:update(new_text)
       last_page_num = self.scroll_text_w.htmlbox_widget.page_count
 
       -- Convert Markdown to HTML and recreate the ScrollHtmlWidget with the new text
-      local html_body, err = MD(self.text, {})
+      local html_body, err = MD(self.text)
       if err then
         logger.warn("ChatGPTViewer: could not generate HTML", err)
         -- Fallback to plain text if HTML generation fails
@@ -960,6 +960,57 @@ function ChatGPTViewer:update(new_text)
     end
     UIManager:setDirty(self.frame, "partial")
   end
+end
+
+-- Lightweight API for periodic streaming updates
+function ChatGPTViewer:updateStreamingMarkdown(new_text)
+  -- Always replace with new text
+  self.text = new_text
+
+  if self.render_markdown then
+    local html_body, err = MD(self.text)
+    if err then
+      logger.warn("ChatGPTViewer: could not generate HTML", err)
+      html_body = self.text or "Missing text."
+    end
+    local css = VIEWER_CSS .. ((self.assistant.settings:readSetting("response_is_rtl")
+                                or self.assistant.ui_language_is_rtl) and RTL_CSS or "")
+    self.scroll_text_w = ScrollHtmlWidget:new {
+      html_body = html_body,
+      css = css,
+      default_font_size = Screen:scaleBySize(self.assistant.settings:readSetting("response_font_size") or 20),
+      width = self.width - 2 * self.text_padding - 2 * self.text_margin,
+      height = self.textw:getSize().h - 2 * self.text_padding - 2 * self.text_margin,
+      dialog = self,
+    }
+  else
+    self.scroll_text_w = ScrollTextWidget:new{
+      text = new_text,
+      face = self.text_face,
+      fgcolor = self.fgcolor,
+      width = self.width - 2 * self.text_padding - 2 * self.text_margin,
+      height = self.textw:getSize().h - 2 * self.text_padding - 2 * self.text_margin,
+      dialog = self,
+      alignment = self.alignment,
+      justified = self.justified,
+      lang = self.lang,
+      para_direction_rtl = self.para_direction_rtl,
+      auto_para_direction = self.auto_para_direction,
+      alignment_strict = self.alignment_strict,
+    }
+  end
+
+  self.textw:clear()
+  self.textw[1] = self.scroll_text_w
+  -- Simple auto-stick to bottom during streaming if enabled
+  if self.assistant and self.assistant.settings:readSetting("stream_auto_scroll", true) then
+    if self.render_markdown then
+      self.scroll_text_w:scrollToRatio(1)
+    else
+      self.scroll_text_w:scrollToBottom()
+    end
+  end
+  UIManager:setDirty(self.frame, "partial")
 end
 
 return ChatGPTViewer
