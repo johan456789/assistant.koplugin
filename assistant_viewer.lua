@@ -117,6 +117,7 @@ local ChatGPTViewer = InputContainer:extend {
   auto_para_direction = true,
   alignment_strict = false,
   render_markdown = true, -- converts markdown to HTML and displays the HTML
+  is_streaming = false,
 
   title_face = nil,               -- use default from TitleBar
   title_multilines = nil,         -- see TitleBar for details
@@ -289,8 +290,7 @@ function ChatGPTViewer:init()
     id = "top",
     callback = function()
       if self.render_markdown then
-        -- If rendering in a ScrollHtmlWidget, use scrollToRatio
-        self.scroll_text_w:scrollToRatio(0)
+        self:setScrollRatio(0)
       else
         self.scroll_text_w:scrollToTop()
       end
@@ -304,8 +304,7 @@ function ChatGPTViewer:init()
     id = "bottom",
     callback = function()
       if self.render_markdown then
-        -- If rendering in a ScrollHtmlWidget, use scrollToRatio
-        self.scroll_text_w:scrollToRatio(1)
+        self:setScrollRatio(1)
       else
         self.scroll_text_w:scrollToBottom()
       end
@@ -314,8 +313,9 @@ function ChatGPTViewer:init()
     allow_hold_when_disabled = true,
   })
   
+  local close_button_text = self.is_streaming and _("⏹ Stop") or _("Close")
   table.insert(default_buttons, {
-    text = _("Close"),
+    text = close_button_text,
     id = "close",
     callback = function()
       self:onClose()
@@ -965,6 +965,79 @@ function ChatGPTViewer:html_link_tapped_callback(link)
     self:askAnotherQuestion(true) -- simple_mode
     self.input_dialog:setInputText(link.uri:sub(#SUGGESTION_PREFIX+1), nil, false)
   end
+end
+
+function ChatGPTViewer:getScrollRatio()
+    if not self.scroll_text_w or not self.scroll_text_w.htmlbox_widget then return 0 end
+    local page = self.scroll_text_w.htmlbox_widget.page_num
+    local count = self.scroll_text_w.htmlbox_widget.page_count
+    if count and count > 1 then
+        return (page - 1) / (count - 1)
+    end
+    return 0
+end
+
+function ChatGPTViewer:setScrollRatio(ratio)
+    if not self.scroll_text_w or not self.scroll_text_w.htmlbox_widget then return end
+    local count = self.scroll_text_w.htmlbox_widget.page_count
+    if count and count > 1 then
+        local page = math.floor(ratio * (count - 1) + 1)
+        self.scroll_text_w:scrollToPage(page)
+    end
+end
+
+function ChatGPTViewer:isNearBottom(threshold)
+    threshold = threshold or 0
+    return self:getScrollRatio() >= (1.0 - threshold)
+end
+
+function ChatGPTViewer:onStreamComplete()
+    self.is_streaming = false
+    local close_button = self.button_table:getButtonById("close")
+    if close_button then
+        close_button:setText(_("Close"))
+        close_button:refresh()
+    end
+end
+
+function ChatGPTViewer:updateStreamingMarkdown(new_text)
+    local prev_ratio = self:getScrollRatio()
+    local was_near_bottom = self:isNearBottom(0.02)
+
+    self.text = new_text
+    local html_body, err = MD(self.text, {})
+    if err then
+        logger.warn("ChatGPTViewer: could not generate HTML", err)
+        html_body = self.text or "Missing text."
+    end
+    local css = VIEWER_CSS .. ((self.assistant.settings:readSetting("response_is_rtl")
+                                or self.assistant.ui_language_is_rtl) and RTL_CSS or "")
+
+    if self.scroll_text_w and self.scroll_text_w.htmlbox_widget then
+        self.scroll_text_w.htmlbox_widget:setHtml(html_body, css)
+        self.scroll_text_w:update()
+    else
+        self.scroll_text_w = ScrollHtmlWidget:new {
+            html_body = html_body,
+            css = css,
+            default_font_size = Screen:scaleBySize(self.assistant.settings:readSetting("response_font_size") or 20),
+            width = self.width - 2 * self.text_padding - 2 * self.text_margin,
+            height = self.textw:getSize().h - 2 * self.text_padding - 2 * self.text_margin,
+            dialog = self,
+            html_link_tapped_callback = function(link)
+                self:html_link_tapped_callback(link)
+            end
+        }
+        self.textw:clear()
+        self.textw[1] = self.scroll_text_w
+    end
+
+    if self.assistant.settings:readSetting("stream_mode_auto_scroll", true) and was_near_bottom then
+        self:setScrollRatio(1)
+    else
+        self:setScrollRatio(prev_ratio)
+    end
+    UIManager:setDirty(self.frame, "partial")
 end
 
 function ChatGPTViewer:update(new_text)
