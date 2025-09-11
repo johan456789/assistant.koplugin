@@ -375,6 +375,30 @@ function SettingsDialog:init()
                 end
             },
         }},
+        {{
+            {
+                id="stream_render_interval_ms",
+                text=T(_("Stream Render Interval: %1ms"), self.assistant.settings:readSetting("stream_render_interval_ms") or 750),
+                font_bold = true,
+                font_size = 18,
+                callback=function()
+                    local interval = self.assistant.settings:readSetting("stream_render_interval_ms") or 750
+                    local widget = SpinWidget:new{
+                        title_text = _("Stream Render Interval (ms)"),
+                        value = interval,
+                        value_min = 300, value_max = 2000, default_value = 750,
+                        keep_shown_on_apply = true,
+                        callback = function(spin)
+                            self.assistant.settings:saveSetting("stream_render_interval_ms", spin.value)
+                            self.assistant.updated = true
+                            local button = self.middle_button_table.button_by_id["stream_render_interval_ms"]
+                            button:setText(T(_("Stream Render Interval: %1ms"), spin.value), button.width)
+                        end,
+                    }
+                    UIManager:show(widget)
+                end
+            },
+        }},
     }
     self:mergeLayoutInVertical(self.middle_button_table, #self.layout)
 

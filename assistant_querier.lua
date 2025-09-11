@@ -4,6 +4,7 @@ local T = require("ffi/util").template
 local InfoMessage = require("ui/widget/infomessage")
 local ConfirmBox  = require("ui/widget/confirmbox")
 local InputDialog = require("ui/widget/inputdialog")
+local ChatGPTViewer = require("assistant_viewer")
 local InputText = require("ui/widget/inputtext")
 local UIManager = require("ui/uimanager")
 local Font = require("ui/font")
@@ -24,6 +25,10 @@ local Querier = {
     provider_name = nil,
     interrupt_stream = nil,      -- function to interrupt the stream query
     user_interrupted = false,  -- flag to indicate if the stream was interrupted
+    stream_buffer = nil,
+    stream_last_render_ts = nil,
+    stream_timer_handle = nil,
+    stream_active_viewer = nil,
 }
 
 function Querier:new(o)
@@ -81,25 +86,6 @@ function Querier:load_model(provider_name)
 end
 
 -- InputText class for showing streaming responses
--- ignores all input events
-local StreamText = InputText:extend{}
-function StreamText:addChars(chars)
-    self.readonly = false                           -- widget is inited with `readonly = true`
-    InputText.addChars(self, chars)                 -- can only add text by our method
-end
-function StreamText:initTextBox(text, char_added)
-    self.for_measurement_only = true                -- trick the method from super class
-    InputText.initTextBox(self, text, char_added)   -- skips `UIManager:setDirty`
-    -- use our own method of refresh, `fast` is suitable for stream responding 
-    UIManager:setDirty(self.parent, function() return "fast", self.dimen end)
-    self.for_measurement_only = false
-end
-function  StreamText:onCloseWidget()
-    -- fast mode makes screen dirty, clean it with `flashui`
-    UIManager:setDirty(self.parent, function() return "flashui", self.dimen end)
-    return InputText.onCloseWidget(self)
-end
-
 function Querier:showError(err)
     local dialog
     if self.user_interrupted then
@@ -142,72 +128,59 @@ function Querier:query(message_history, title)
     self.handler:resetTrapWidget()
     UIManager:close(infomsg)
 
-    -- when res is a function, it means we are in streaming mode
-    -- open a stream dialog and run the background query in a subprocess
     if type(res) == "function" then
-        self.user_interrupted = false -- reset the stream interrupted flag
-        local streamDialog 
+        self.user_interrupted = false
+        self.stream_buffer = {}
+        self.stream_last_render_ts = 0
+        self.stream_timer_handle = nil
 
-        local function _closeStreamDialog()
-            if self.interrupt_stream then self.interrupt_stream() end
-            UIManager:close(streamDialog)
-        end
-
-        streamDialog = InputDialog:new{
-            width = Screen:getWidth() - Screen:scaleBySize(30),
+        local description = T("☁ %1 ⚡ %2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model"))
+        self.stream_active_viewer = ChatGPTViewer:new{
+            assistant = self.assistant,
             title = _("AI is responding"),
-            description = T("☁ %1/%2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model")),
-            inputtext_class = StreamText, -- use our custom InputText class
-            input_face = Font:getFace("infofont", self.settings:readSetting("response_font_size") or 20),
-            title_bar_left_icon = "appbar.settings",
-            title_bar_left_icon_tap_callback = function ()
-                self.assistant:showSettings()
-            end,
-
-            readonly = true,  
-            fullscreen = false, use_available_height = true,
-            allow_newline = true, add_nav_bar = false, cursor_at_end = true, add_scroll_buttons = true,
-            condensed = true, auto_para_direction = true, is_movable = false, scroll_by_pan = true, 
-            buttons = {
-                {
-                    {
-                        text = _("⏹ Stop"),
-                        id = "close", -- id:close response to default cancel action (esc key ...)
-                        callback = _closeStreamDialog,
-                    },
-                }
-            }
-        }
-
-        --  adds a close button to the top right
-        streamDialog.title_bar.close_callback = _closeStreamDialog
-        streamDialog.title_bar:init()
-        UIManager:show(streamDialog)
-
-        local stream_mode_auto_scroll = self.settings:readSetting("stream_mode_auto_scroll", true)
-        local ok, content, err = pcall(self.processStream, self, res, function (content, buffer)
-            UIManager:nextTick(function ()
-                -- schedule the text update in the UIManager task queue
-                if stream_mode_auto_scroll then
-                    streamDialog:addTextToInput(content)
-                else
-                    streamDialog._input_widget:setText(table.concat(buffer), true)
+            text = description .. "\n\n" .. _("Generating..."),
+            render_markdown = true,
+            is_streaming = true,
+            close_callback = function()
+                if self.interrupt_stream then self.interrupt_stream() end
+                if self.stream_timer_handle then
+                    UIManager:unschedule(self.stream_timer_handle)
+                    self.stream_timer_handle = nil
                 end
-            end)
-        end)
+                self.stream_active_viewer = nil
+            end,
+        }
+        UIManager:show(self.stream_active_viewer)
+
+        local ok, content, err = pcall(self.processStream, self, res)
         if not ok then
             logger.warn("Error processing stream: " .. tostring(content))
-            err = content -- content contains the error message
+            err = content
         end
 
-        UIManager:close(streamDialog)
+        if self.stream_timer_handle then
+            UIManager:unschedule(self.stream_timer_handle)
+            self.stream_timer_handle = nil
+        end
+
+        if self.stream_active_viewer and self.stream_active_viewer:isShown() then
+            if err then
+                self.stream_active_viewer:update(description .. "\n\n" .. "```\n" .. err .. "\n```")
+            else
+                self.stream_active_viewer:update(description .. "\n\n" .. content)
+                self.stream_active_viewer:onStreamComplete()
+            end
+        end
+
+        self.stream_buffer = nil
+        self.stream_active_viewer = nil
 
         if self.user_interrupted then
             return nil, _("Request cancelled by user.")
         end
 
         if err then
-            return nil, err:gsub("^[\n%s]*", "") -- clean leading spaces and newlines
+            return nil, err:gsub("^[\n%s]*", "")
         end
 
         res = content
@@ -226,206 +199,186 @@ function Querier:query(message_history, title)
     return res
 end
 
---- func description: run the stream request in the background 
---  and process the response in realtime, output to the trunk callback
--- return the full response content when the stream ends
-function Querier:processStream(bgQuery, trunk_callback)
-    local pid, parent_read_fd = ffiutil.runInSubProcess(bgQuery, true) -- pipe: true
+function Querier:processStream(bgQuery)
+    local pid, parent_read_fd = ffiutil.runInSubProcess(bgQuery, true)
 
     if not pid then
         logger.warn("Failed to start background query process.")
         return nil, _("Failed to start subprocess for request")
     end
 
-    local _coroutine = coroutine.running()  
-  
-    self.interrupt_stream = function()  
-        coroutine.resume(_coroutine, false)  
-    end  
-  
-    local non200 = false -- flag to indicate if we received a non-200 response
-    local check_interval_sec = 0.125 -- loop check interval: 125ms  
-    local chunksize = 1024 * 16 -- buffer size for reading data
-    local buffer = ffi.new('char[?]', chunksize, {0}) -- Buffer for reading data
+    local _coroutine = coroutine.running()
+    self.interrupt_stream = function()
+        coroutine.resume(_coroutine, false)
+    end
+
+    local non200 = false
+    local check_interval_sec = 0.125
+    local chunksize = 1024 * 16
+    local buffer = ffi.new('char[?]', chunksize, {0})
     local buffer_ptr = ffi.cast('void*', buffer)
-    local completed = false   -- Flag to indicate if the reading is completed
-    local partial_data = ""   -- Buffer for incomplete line data
-    local result_buffer = {}  -- Buffer for storing results
-    local reasoning_content_buffer = {}  -- Buffer for storing results
+    local completed = false
+    local partial_data = ""
+    local result_buffer = {}
+    local reasoning_content_buffer = {}
 
-    while true do  
+    local render_interval_ms = self.settings:readSetting("stream_render_interval_ms", 750)
 
+    local function render_scheduled()
+        if not self.stream_active_viewer or not self.stream_active_viewer:isShown() then
+            return
+        end
+
+        if #self.stream_buffer == 0 then return end
+
+        local description = T("☁ %1 ⚡ %2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model"))
+        table.insert(result_buffer, table.concat(self.stream_buffer))
+        self.stream_buffer = {}
+        local full_text = table.concat(result_buffer)
+        self.stream_active_viewer:updateStreamingMarkdown(description .. "\n\n" .. full_text)
+        self.stream_last_render_ts = os.time()
+    end
+
+    while true do
         if completed then break end
-  
-        -- Schedule next check and yield control  
-        local go_on_func = function() coroutine.resume(_coroutine, true) end  
-        UIManager:scheduleIn(check_interval_sec, go_on_func)  
-        local go_on = coroutine.yield()  -- Wait for the next check or user interruption
-        if not go_on then -- User interruption  
+
+        local go_on_func = function() coroutine.resume(_coroutine, true) end
+        UIManager:scheduleIn(check_interval_sec, go_on_func)
+        local go_on = coroutine.yield()
+        if not go_on then
             self.user_interrupted = true
             logger.info("User interrupted the stream processing")
-            UIManager:unschedule(go_on_func)  
-            break  
-        end  
+            UIManager:unschedule(go_on_func)
+            break
+        end
 
-        local readsize = ffiutil.getNonBlockingReadSize(parent_read_fd) 
+        local readsize = ffiutil.getNonBlockingReadSize(parent_read_fd)
         if readsize > 0 then
             local bytes_read = tonumber(ffi.C.read(parent_read_fd, buffer_ptr, chunksize))
             if bytes_read < 0 then
                 local err = ffi.errno()
                 logger.warn("readAllFromFD() error: " .. ffi.string(ffi.C.strerror(err)))
                 break
-            elseif bytes_read == 0 then -- EOF, no more data to read
+            elseif bytes_read == 0 then
                 completed = true
                 break
             else
-                -- Convert binary data to string and append to partial buffer
                 local data_chunk = ffi.string(buffer, bytes_read)
                 partial_data = partial_data .. data_chunk
-                
-                -- Process complete lines
+
                 while true do
-                    -- Find the next newline character
                     local line_end = partial_data:find("[\r\n]")
-                    if not line_end then break end  -- No complete line yet, continue reading
-                    
-                    -- Extract the complete line
+                    if not line_end then break end
                     local line = partial_data:sub(1, line_end - 1)
                     partial_data = partial_data:sub(line_end + 1)
-                    
-                    -- Check if this is an Server-Sent-Event (SSE) data line
-                    if line:sub(1, 6) == "data: " then
-                        -- Clean up the JSON string (remove "data:" prefix and trim whitespace)
-                        local json_str = koutil.trim(line:sub(7))
-                        if json_str == '[DONE]' then break end -- end of SSE stream
 
-                        -- Safely parse the JSON
+                    if line:sub(1, 6) == "data: " then
+                        local json_str = koutil.trim(line:sub(7))
+                        if json_str == '[DONE]' then break end
+
                         local ok, event = pcall(rapidjson.decode, json_str, {null = nil})
                         if ok and event then
-                        
                             local reasoning_content, content
-
                             local choice = koutil.tableGetValue(event, "choices", 1)
-                            if choice then -- OpenAI (compatiable) API
-                                if koutil.tableGetValue(choice, "finish_reason") then content="\n" end
+                            if choice then
+                                if koutil.tableGetValue(choice, "finish_reason") then content = "\n" end
                                 local delta = koutil.tableGetValue(choice, "delta")
                                 if delta then
                                     reasoning_content = koutil.tableGetValue(delta, "reasoning_content")
                                     content = koutil.tableGetValue(delta, "content")
-                                    -- gork4 ouputs empty reasoning messages, logs '.' here to indicate the process works
                                     if not content and not reasoning_content then reasoning_content = "." end
                                 end
                             else
-                                content =
-                                    koutil.tableGetValue(event, "candidates", 1, "content", "parts", 1, "text") or  -- Genmini API
-                                    koutil.tableGetValue(event, "delta", "text") or   -- Anthropic streaming (content_block_delta)
-                                    koutil.tableGetValue(event, "content", 1, "text") -- Anthropic non-stream message event
+                                content = koutil.tableGetValue(event, "candidates", 1, "content", "parts", 1, "text") or
+                                          koutil.tableGetValue(event, "delta", "text") or
+                                          koutil.tableGetValue(event, "content", 1, "text")
                             end
-                                
+
                             if type(content) == "string" and #content > 0 then
-                                table.insert(result_buffer, content)
-                                if trunk_callback then trunk_callback(content, result_buffer) end
+                                table.insert(self.stream_buffer, content)
                             elseif type(reasoning_content) == "string" and #reasoning_content > 0 then
                                 table.insert(reasoning_content_buffer, reasoning_content)
-                                if trunk_callback then trunk_callback(reasoning_content, reasoning_content_buffer) end
                             elseif content == nil and reasoning_content == nil then
                                 logger.warn("Unexpected SSE data:", json_str)
                             end
                         else
                             logger.warn("Failed to parse JSON from SSE data:", json_str)
                         end
-                    elseif line:sub(1, 7) == "event: " then
-                        -- Ignore SSE event lines (from Anthropic)
-                    elseif line:sub(1, 1) == ":" then
-                        -- SSE empty events, nothing to do
                     elseif line:sub(1, 1) == "{" then
-                        -- If the line starts with '{', it might be a JSON object
-                        local ok, j = pcall(rapidjson.decode, line, {null=nil})
+                        local ok, j = pcall(rapidjson.decode, line, {null = nil})
                         if ok and j then
-                            -- log the json
                             local err_message = koutil.tableGetValue(j, "error", "message")
-                            if err_message then
-                                table.insert(result_buffer, err_message)
-                            end
-
-                            if trunk_callback then
-                                trunk_callback(line)  -- Output to trunk callback
-                                logger.info("JSON object received:", line)
-                            end
+                            if err_message then table.insert(result_buffer, err_message) end
                         else
-                            -- the json was breaked into lines, just log the raw line
-                            table.insert(result_buffer, line)  -- Add the raw line to the result
+                            table.insert(result_buffer, line)
                         end
                     elseif line:sub(1, #(self.handler.PROTOCOL_NON_200)) == self.handler.PROTOCOL_NON_200 then
-                        -- child writes a non-200 response 
                         non200 = true
-                        table.insert(result_buffer, "\n\n" .. line:sub(#(self.handler.PROTOCOL_NON_200)+1))
-                        break -- the request is done, no more data to read
-                    else
-                        if #koutil.trim(line) > 0 then
-                            -- If the line is not empty, log it as a warning
-                            table.insert(result_buffer, line)  -- Add the raw line to the result
-                            logger.warn("Unrecognized line format:", line)
+                        table.insert(result_buffer, "\n\n" .. line:sub(#(self.handler.PROTOCOL_NON_200) + 1))
+                        break
+                    elseif #koutil.trim(line) > 0 and line:sub(1, 7) ~= "event: " and line:sub(1, 1) ~= ":" then
+                        table.insert(result_buffer, line)
+                        logger.warn("Unrecognized line format:", line)
+                    end
+                end
+
+                if #self.stream_buffer > 0 and not self.stream_timer_handle then
+                    local render_callback
+                    render_callback = function()
+                        render_scheduled()
+                        self.stream_timer_handle = nil
+                        if self.stream_buffer and #self.stream_buffer > 0 then
+                            self.stream_timer_handle = UIManager:scheduleIn(render_interval_ms / 1000, render_callback)
                         end
                     end
+                    self.stream_timer_handle = UIManager:scheduleIn(render_interval_ms / 1000, render_callback)
                 end
             end
         elseif readsize == 0 then
-            -- No data to read, check if subprocess is done
             completed = ffiutil.isSubProcessDone(pid)
         else
-            -- Error reading from the file descriptor
             local err = ffi.errno()
             logger.warn("Error reading from parent_read_fd:", err, ffi.string(ffi.C.strerror(err)))
             break
         end
     end
 
-    ffiutil.terminateSubProcess(pid) -- Terminate the subprocess when user interrupted 
-    self.interrupt_stream = nil  -- Clear the interrupt function
+    ffiutil.terminateSubProcess(pid)
+    self.interrupt_stream = nil
 
-    -- read loop ended, clean up subprocess
-    local collect_interval_sec = 5 -- collect cancelled cmd every 5 second, no hurry
-    local collect_and_clean
-    collect_and_clean = function()
+    local collect_interval_sec = 5
+    local function collect_and_clean()
         if ffiutil.isSubProcessDone(pid) then
-            if parent_read_fd then
-                ffiutil.readAllFromFD(parent_read_fd) -- close it
-            end
+            if parent_read_fd then ffiutil.readAllFromFD(parent_read_fd) end
             logger.dbg("collected previously dismissed subprocess")
         else
             if parent_read_fd and ffiutil.getNonBlockingReadSize(parent_read_fd) ~= 0 then
-                -- If subprocess started outputting to fd, read from it,
-                -- so its write() stops blocking and subprocess can exit
                 ffiutil.readAllFromFD(parent_read_fd)
-                -- We closed our fd, don't try again to read or close it
                 parent_read_fd = nil
             end
-            -- reschedule to collect it
             UIManager:scheduleIn(collect_interval_sec, collect_and_clean)
             logger.dbg("previously dismissed subprocess not yet collectable")
         end
     end
     UIManager:scheduleIn(collect_interval_sec, collect_and_clean)
 
+    if #self.stream_buffer > 0 then
+        table.insert(result_buffer, table.concat(self.stream_buffer))
+        self.stream_buffer = {}
+    end
+
     local ret = koutil.trim(table.concat(result_buffer))
     if non200 then
-        -- try to parse the json, returns only message from the API.
         if ret:sub(1, 1) == '{' then
             local endPos = ret:reverse():find("}")
             if endPos and endPos > 0 then
                 local ok, j = pcall(rapidjson.decode, ret:sub(1, #ret - endPos + 1), {null=nil})
                 if ok then
-                    local err
-                    err = koutil.tableGetValue(j, "error", "message") -- OpenAI / Anthropic / Gemini 
-                    if err then return nil, err end
-                    err = koutil.tableGetValue(j, "message") -- Mistral / Cohere
+                    local err = koutil.tableGetValue(j, "error", "message") or koutil.tableGetValue(j, "message")
                     if err then return nil, err end
                 end
             end
         end
-
-        -- return all received content as error message
         return nil, ret
     else
         local reasoning = table.concat(reasoning_content_buffer):gsub("^%.+", "", 1)
