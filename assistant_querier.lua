@@ -143,6 +143,10 @@ function Querier:query(message_history, title)
             is_streaming = true,
             close_callback = function()
                 if self.interrupt_stream then self.interrupt_stream() end
+                if self.stream_timer_handle then
+                    UIManager:unschedule(self.stream_timer_handle)
+                    self.stream_timer_handle = nil
+                end
             end,
         }
         UIManager:show(self.stream_active_viewer)
@@ -220,7 +224,10 @@ function Querier:processStream(bgQuery)
     local render_interval_ms = self.settings:readSetting("stream_render_interval_ms", 750)
 
     local function render_scheduled()
-        if not self.stream_active_viewer or not self.stream_active_viewer:isShown() then return end
+        if not self.stream_active_viewer or not self.stream_active_viewer:isShown() then
+            return
+        end
+
         if #self.stream_buffer == 0 then return end
 
         local description = T("☁ %1 ⚡ %2", self.provider_name, koutil.tableGetValue(self.provider_settings, "model"))
