@@ -1,4 +1,4 @@
-local api_keys = require("apikeys")
+local api_keys = require("assistant_apikeys")
 
 local CONFIGURATION = {
     -- Choose your preferred AI provider: "anthropic", "openai", "gemini", ...
